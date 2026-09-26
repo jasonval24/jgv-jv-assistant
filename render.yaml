@@ -1,0 +1,37 @@
+# JV Assistant — personal voice/SMS for Jason Valenzuela (+19564684455).
+# Do not put secret values in this file. Not Blueshore Art.
+
+services:
+  - type: web
+    name: jgv-jv-assistant
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8787"
+      - key: HOST
+        value: "0.0.0.0"
+      - key: TWILIO_VOICE_NUMBER
+        value: "+19564684455"
+      - key: TRANSFER_TO_JASON
+        value: "+19564601983"
+      - key: TELEGRAM_CHAT_ID
+        value: "8787733574"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: OPENAI_REALTIME_MODEL
+        sync: false
+      - key: OPENAI_VOICE
+        sync: false
+      - key: OPENAI_CHAT_MODEL
+        value: "gpt-4o-mini"
