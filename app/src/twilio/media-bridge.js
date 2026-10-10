@@ -71,6 +71,8 @@ function withTimeout(promise, ms) {
  * Bidirectional Twilio Media Streams ↔ OpenAI Realtime.
  * Audio is G.711 μ-law (audio/pcmu) on both sides. No transcoding.
  */
+import { getOutbound, buildFamilyInstructions, FAMILY_TOOL_NAMES, reportOutboundCall } from '../outbound.js';
+
 export function createMediaBridge(twilioWs, options = {}) {
   const logger = options.logger || logEvent;
   const openaiFactory = options.openaiFactory || defaultOpenAIFactory;
@@ -108,6 +110,8 @@ export function createMediaBridge(twilioWs, options = {}) {
     hungUp: false,
     hangupTimer: null,
     seenCalls: new Set(),
+    outbound: null,
+    endSummary: '',
   };
 
   function sendTwilio(obj) {
@@ -328,7 +332,14 @@ export function createMediaBridge(twilioWs, options = {}) {
     }
     let result;
     try {
-      result = await runWithCallContext(context(), () => runToolFn(name, args));
+      if (state.outbound && name === 'end_call') {
+        state.endSummary = String(args.summary || '');
+        result = { ok: true };
+      } else if (state.outbound && !FAMILY_TOOL_NAMES.has(name)) {
+        result = { ok: false, error: 'tool_not_available_on_this_call' };
+      } else {
+        result = await runWithCallContext(context(), () => runToolFn(name, args));
+      }
     } catch (err) {
       result = { ok: false, error: 'tool_failed', message: err?.message || 'tool_failed' };
     }
@@ -380,6 +391,14 @@ export function createMediaBridge(twilioWs, options = {}) {
       }
       return;
     }
+    if (state.outbound && type === 'conversation.item.input_audio_transcription.completed' && event.transcript) {
+      state.outbound.transcript.push({ role: 'user', text: String(event.transcript).trim() });
+      return;
+    }
+    if (state.outbound && (type === 'response.output_audio_transcript.done' || type === 'response.audio_transcript.done') && event.transcript) {
+      state.outbound.transcript.push({ role: 'assistant', text: String(event.transcript).trim() });
+      return;
+    }
     if (type === 'response.created') {
       state.responseActive = true;
       return;
@@ -423,6 +442,12 @@ export function createMediaBridge(twilioWs, options = {}) {
   }
 
   async function configureSession() {
+    if (state.outbound) {
+      const session = buildSessionConfig({ phoneAudio: true, instructionsOverride: buildFamilyInstructions(state.outbound), toolFilter: FAMILY_TOOL_NAMES });
+      sendOpenAI({ type: 'session.update', session });
+      logger('openai_session_update', { callSessionId: state.callSessionId, callSid: state.callSid, outbound: state.outbound.who, toolCount: session.tools.length });
+      return;
+    }
     const caller = await withTimeout(callerLookup(state.from), 800);
     const prefix = buildPhoneInstructionsPrefix({
       callSid: state.callSid,
@@ -473,7 +498,10 @@ export function createMediaBridge(twilioWs, options = {}) {
     state.from = custom.from || start.from || null;
     state.to = custom.to || start.to || null;
     state.callSessionId = callSessionIdForCallSid(state.callSid);
+    state.outbound = getOutbound(custom.ob) || null;
+    if (state.outbound) state.outbound.callSid = state.outbound.callSid || state.callSid;
     logger('twilio_stream_start', {
+      outbound: state.outbound?.who || null,
       callSid: state.callSid,
       callSessionId: state.callSessionId,
       streamSid: state.streamSid,
@@ -536,6 +564,7 @@ export function createMediaBridge(twilioWs, options = {}) {
       if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
     } catch { /* ignore */ }
     void release(reason === 'stop' ? 'websocket_disconnect' : 'websocket_disconnect');
+    if (state.outbound) void reportOutboundCall(state.outbound, { endSummary: state.endSummary, reason: reason || 'close' });
     logger('twilio_socket_closed', {
       callSessionId: state.callSessionId,
       callSid: state.callSid,

@@ -29,6 +29,8 @@ import {
 import { createMediaBridge } from './twilio/media-bridge.js';
 import { logEvent } from './twilio/log.js';
 import { handleInboundSms } from './sms/handler.js';
+import crypto from 'crypto';
+import { getOutbound, placeOutboundCall, previewOutbound } from './outbound.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, '../public');
@@ -196,7 +198,12 @@ export function createServer(options = {}) {
       from,
       to: maskPhone(to) ? to : null,
     });
-    res.type('text/xml').status(200).send(buildStreamTwiml({ streamUrl, callSid, from, to }));
+    const ob = getOutbound(String(req.query?.ob || '')) ? String(req.query.ob) : undefined;
+    if (req.query?.ob && !ob) {
+      res.type('text/xml').status(200).send(sayHangupTwiml('Sorry, this call has expired. Goodbye.'));
+      return;
+    }
+    res.type('text/xml').status(200).send(buildStreamTwiml({ streamUrl, callSid, from, to, ob }));
   });
 
   app.post('/twilio/sms', async (req, res) => {
@@ -237,8 +244,30 @@ export function createServer(options = {}) {
     }
   });
 
+  app.post('/api/outbound-call', async (req, res) => {
+    const secret = process.env.OUTBOUND_CALL_SECRET || '';
+    const got = String(req.get('x-call-secret') || '');
+    if (!secret || got.length !== secret.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(secret))) {
+      res.status(401).json({ ok: false });
+      return;
+    }
+    const who = String(req.body?.to || '').toLowerCase();
+    const message = String(req.body?.message || '').trim().slice(0, 4000);
+    const thread = Array.isArray(req.body?.thread) ? req.body.thread.slice(-20) : [];
+    if (!message) { res.status(400).json({ ok: false, error: 'message_required' }); return; }
+    if (req.body?.dry_run) { res.json(previewOutbound({ who, message, thread })); return; }
+    try {
+      const r = await placeOutboundCall({ who, message, thread, publicBase: config.publicBaseUrl || publicBaseFromRequest(req) });
+      logger('outbound_call_request', { who, ok: Boolean(r.body?.ok), callSid: r.body?.callSid || null, reason: r.body?.reason || r.body?.error || null });
+      res.status(r.status).json(r.body);
+    } catch (err) {
+      res.status(502).json({ ok: false, error: err?.message || 'outbound_failed' });
+    }
+  });
+
   app.post('/twilio/status', (req, res) => {
     if (!requireTwilioSignature(req, res)) return;
+    if (req.body?.AnsweredBy) logger('amd_result', { callSid: req.body?.CallSid || null, answeredBy: req.body.AnsweredBy });
     const callSid = req.body?.CallSid || '';
     const callStatus = String(req.body?.CallStatus || '').toLowerCase();
     const callSessionId = callSessionIdForCallSid(callSid);

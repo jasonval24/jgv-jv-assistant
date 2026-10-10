@@ -20,8 +20,8 @@ export function mediaStreamUrl(publicBase) {
 }
 
 /** TwiML that connects the live call to the Media Streams WebSocket. */
-export function buildStreamTwiml({ streamUrl, callSid, from, to }) {
-  return `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${xmlEscape(streamUrl)}"><Parameter name="callSid" value="${xmlEscape(callSid)}"/><Parameter name="from" value="${xmlEscape(from || '')}"/><Parameter name="to" value="${xmlEscape(to || '')}"/></Stream></Connect></Response>`;
+export function buildStreamTwiml({ streamUrl, callSid, from, to, ob }) {
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${xmlEscape(streamUrl)}"><Parameter name="callSid" value="${xmlEscape(callSid)}"/><Parameter name="from" value="${xmlEscape(from || '')}"/><Parameter name="to" value="${xmlEscape(to || '')}"/>${ob ? `<Parameter name="ob" value="${xmlEscape(ob)}"/>` : ''}</Stream></Connect></Response>`;
 }
 
 export function rejectTwiml() {

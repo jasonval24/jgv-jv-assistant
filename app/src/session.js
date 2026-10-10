@@ -26,7 +26,9 @@ Use resolve_calendar quietly when you need a date. Speak natural dates — never
 }
 
 export function buildSessionConfig(options = {}) {
-  const instructions = options.instructionsPrefix
+  const instructions = options.instructionsOverride
+    ? String(options.instructionsOverride)
+    : options.instructionsPrefix
     ? `${String(options.instructionsPrefix).trim()}\n\n${buildInstructions()}`
     : buildInstructions();
   const audio = {
@@ -51,7 +53,7 @@ export function buildSessionConfig(options = {}) {
     model: config.openaiModel,
     instructions,
     audio,
-    tools: toolDefinitions,
+    tools: options.toolFilter ? toolDefinitions.filter((t) => options.toolFilter.has(t.name)) : toolDefinitions,
     tool_choice: 'auto',
   };
   if (options.phoneAudio) session.output_modalities = ['audio'];
