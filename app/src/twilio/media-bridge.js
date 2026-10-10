@@ -71,7 +71,7 @@ function withTimeout(promise, ms) {
  * Bidirectional Twilio Media Streams ↔ OpenAI Realtime.
  * Audio is G.711 μ-law (audio/pcmu) on both sides. No transcoding.
  */
-import { getOutbound, buildFamilyInstructions, FAMILY_TOOL_NAMES, reportOutboundCall } from '../outbound.js';
+import { getOutbound, inboundFamilyRecord, buildFamilyInstructions, FAMILY_TOOL_NAMES, reportOutboundCall } from '../outbound.js';
 
 export function createMediaBridge(twilioWs, options = {}) {
   const logger = options.logger || logEvent;
@@ -504,7 +504,7 @@ export function createMediaBridge(twilioWs, options = {}) {
     state.from = custom.from || start.from || null;
     state.to = custom.to || start.to || null;
     state.callSessionId = callSessionIdForCallSid(state.callSid);
-    state.outbound = getOutbound(custom.ob) || null;
+    state.outbound = getOutbound(custom.ob) || inboundFamilyRecord(state.from) || null;
     if (state.outbound) state.outbound.callSid = state.outbound.callSid || state.callSid;
     logger('twilio_stream_start', {
       outbound: state.outbound?.who || null,

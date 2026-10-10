@@ -15,6 +15,23 @@ export const RECIPIENTS = {
 
 setInterval(() => { const n = Date.now(); for (const [k, v] of registry) if (v.exp < n) registry.delete(k); }, 60000).unref();
 
+const DEFAULT_ANNA_INBOUND_MESSAGE = "Jason asked me to go over the projects you have for Ollie, so I can coordinate with Ollie. For each project, what do you want done, and when do you need it by?";
+const DEFAULT_ANNA_INBOUND_INTERVIEW = "Interview Anna about each of Ollie's projects. Get a list of every project, and for each: what she wants done (scope), timing or deadline, budget only if she offers it (don't ask about money), materials or access needed (keys, gate codes, supplies, who will be home), and the best way and time to reach Ollie. Summarize the list back to her at the end to confirm, and ask if there's anything else for Ollie or for Jason.";
+const norm = (p) => String(p || '').replace(/[^0-9]/g, '').slice(-10);
+
+/** Inbound call from a known family caller (Anna) -> same persona + interview. */
+export function inboundFamilyRecord(from) {
+  const anna = process.env.ANNA_PHONE || '+19564571661';
+  if ((process.env.ANNA_INBOUND || 'on').toLowerCase() === 'off' || !from || norm(from) !== norm(anna)) return null;
+  return { token: null, who: 'anna', name: 'Anna Valenzuela', direction: 'inbound', to: from,
+    message: process.env.ANNA_INBOUND_MESSAGE || DEFAULT_ANNA_INBOUND_MESSAGE,
+    interview: process.env.ANNA_INBOUND_INTERVIEW || DEFAULT_ANNA_INBOUND_INTERVIEW,
+    thread: [
+      { from: 'Grokberto', text: "Hey Anna! Jason says I should hear about Ollie's projects. Tell me all about them!" },
+      { from: 'Grokberto', text: "For each of Ollie's projects, let me know what you want done and when you need it by, so I can coordinate with Ollie." },
+    ], transcript: [], created: Date.now(), exp: Date.now() + TTL_MS };
+}
+
 export function getOutbound(token) { const r = token && registry.get(token); return r && r.exp > Date.now() ? r : null; }
 
 function clip(s, n) { return String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, n); }
@@ -24,7 +41,7 @@ export function buildFamilyInstructions(rec) {
   const now = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Chicago', dateStyle: 'full', timeStyle: 'short' }).format(new Date());
   const isAnna = rec.who === 'anna';
   return `# ROLE
-You are Grokberto, Jason Valenzuela's personal assistant, placing an OUTBOUND phone call to ${rec.name}${isAnna ? " (Jason's wife; family)" : ''}.
+You are Grokberto, Jason Valenzuela's personal assistant, ${rec.direction === 'inbound' ? 'ANSWERING an inbound phone call from' : 'placing an OUTBOUND phone call to'} ${rec.name}${isAnna ? " (Jason's wife; family)" : ''}.
 It is ${now} (America/Chicago; never say the time zone aloud).
 Talk like a warm, natural person on the phone: short sentences, one idea at a time, let them interrupt, no lists read aloud, no markdown, no URLs (say "I put the link in the group chat").
 
@@ -35,7 +52,7 @@ ${clip(rec.message, 3000)}
 ${thread}
 
 # OPENING
-First words: "Hi ${isAnna ? 'Anna' : 'Jason'}, it's Grokberto, Jason's assistant." Then go straight into the message. Do not ask "can you hear me".
+${rec.direction === 'inbound' ? `First words: "Hi Anna, it's Grokberto, Jason's assistant. Thanks for calling!" Then go straight into the topic below.` : `First words: "Hi ${isAnna ? 'Anna' : 'Jason'}, it's Grokberto, Jason's assistant." Then go straight into the message.`} Do not ask "can you hear me".
 If you hear a voicemail greeting, a beep, or a call-screening prompt asking your name and reason: say once, briefly, "This is Grokberto, Jason's assistant, with a message for ${isAnna ? 'Anna' : 'Jason'}", give a one or two sentence version of the message, say it's also in the group chat, then call end_call. Never chat with a machine.
 
 # FOLLOW-UP QUESTIONS
@@ -111,8 +128,9 @@ export async function reportOutboundCall(rec, { endSummary, reason } = {}) {
     } catch { /* keep fallbacks */ }
   }
   const url = process.env.ROUTINE_URL, key = process.env.ROUTINE_KEY;
+  console.log(JSON.stringify({ event: 'family_call_summary', who: rec.who, direction: rec.direction || 'outbound', callSid: rec.callSid, reached_human: reached, summary, requests_for_jason, items }));
   if (!url) return;
-  const payload = { source: `${rec.who}_call_summary`, who: rec.who, call_sid: rec.callSid, reached_human: reached, answered_by: rec.answeredBy || null, end_reason: reason || null,
-    message_delivered: rec.message, summary: summary || (transcript ? '' : 'No conversation (unanswered, voicemail, or hung up).'), requests_for_jason, items, to_masked: rec.to ? rec.to.replace(/.(?=.{4})/g, '*') : null, transcript };
+  const payload = { source: `${rec.who}_call_summary`, direction: rec.direction || 'outbound', who: rec.who, call_sid: rec.callSid, reached_human: reached, answered_by: rec.answeredBy || null, end_reason: reason || null,
+    message_delivered: rec.message, summary: summary || (transcript ? '' : 'No conversation (unanswered, voicemail, or hung up).'), requests_for_jason, items, to_masked: rec.direction === 'inbound' ? null : (rec.to ? rec.to.replace(/.(?=.{4})/g, '*') : null), caller_masked: rec.direction === 'inbound' && rec.to ? rec.to.replace(/.(?=.{4})/g, '*') : null, transcript };
   await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(payload) }).catch(() => {});
 }
