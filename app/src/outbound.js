@@ -10,6 +10,7 @@ const lastCallAt = new Map(); // who -> ms
 
 export const RECIPIENTS = {
   anna: { name: 'Anna Valenzuela', phone: () => process.env.ANNA_PHONE || '', enabled: () => (process.env.ANNA_CALLS || 'on').toLowerCase() !== 'off' },
+  jason_merge_anna: { name: 'Anna Valenzuela', summaryWho: 'anna', merge: true, phone: () => config.jasonCell, enabled: () => (process.env.JASON_OUTBOUND_CALLS || 'off').toLowerCase() === 'on' },
   jason: { name: 'Jason Valenzuela', phone: () => config.jasonCell, enabled: () => (process.env.JASON_OUTBOUND_CALLS || 'off').toLowerCase() === 'on' },
 };
 
@@ -51,8 +52,14 @@ ${clip(rec.message, 3000)}
 # RECENT FAMILY GROUP CHAT (Telegram "JV AV Asst Bot Chat"; context only)
 ${thread}
 
-# OPENING
-${rec.direction === 'inbound' ? `First words: "Hi Anna, it's Grokberto, Jason's assistant. Thanks for calling!" Then go straight into the topic below.` : `First words: "Hi ${isAnna ? 'Anna' : 'Jason'}, it's Grokberto, Jason's assistant." Then go straight into the message.`} Do not ask "can you hear me".
+${rec.merge ? `# OPENING (THREE-WAY CALL)
+You are calling Jason's cell. Jason will merge Anna into this call.
+First words: "Hi Jason, it's Grokberto. I'll wait here until Anna joins." Then stay quiet and wait patiently, up to about 2 minutes. Ignore silence, hold music, ringing, and clicks; do not fill silence and do not end the call while waiting. If Jason talks to you, answer briefly.
+When Anna joins (a new voice, or Jason says she's on), say "Hi Anna, it's Grokberto, Jason's assistant." and start the interview. Both Jason and Anna may speak; answer either of them.
+Never treat this as voicemail. Only end the call if both say goodbye or Jason tells you to.
+
+` : ''}# OPENING
+${rec.merge ? '(The rules below apply only to non-merge calls; skip them.)\n' : ''}${rec.direction === 'inbound' ? `First words: "Hi Anna, it's Grokberto, Jason's assistant. Thanks for calling!" Then go straight into the topic below.` : `First words: "Hi ${isAnna ? 'Anna' : 'Jason'}, it's Grokberto, Jason's assistant." Then go straight into the message.`} Do not ask "can you hear me".
 If you hear a voicemail greeting, a beep, or a call-screening prompt asking your name and reason: say once, briefly, "This is Grokberto, Jason's assistant, with a message for ${isAnna ? 'Anna' : 'Jason'}", give a one or two sentence version of the message, say it's also in the group chat, then call end_call. Never chat with a machine.
 
 # FOLLOW-UP QUESTIONS
@@ -82,7 +89,7 @@ export async function placeOutboundCall({ who, message, thread, interview, publi
   if (wait > 0) return { status: 429, body: { ok: false, reason: 'rate_limited', retry_after_s: Math.ceil(wait / 1000) } };
   if (!config.twilioAccountSid || !config.twilioAuthToken || !publicBase) return { status: 503, body: { ok: false, error: 'twilio_or_public_base_unset' } };
   const token = crypto.randomBytes(12).toString('hex');
-  const rec = { token, who, name: rcp.name, to, message, thread, interview, transcript: [], created: Date.now(), exp: Date.now() + TTL_MS };
+  const rec = { token, who: rcp.summaryWho || who, merge: !!rcp.merge, name: rcp.name, to, message, thread, interview, transcript: [], created: Date.now(), exp: Date.now() + TTL_MS };
   registry.set(token, rec);
   lastCallAt.set(who, Date.now());
   const form = new URLSearchParams({
@@ -90,7 +97,7 @@ export async function placeOutboundCall({ who, message, thread, interview, publi
     Url: `${publicBase}/twilio/voice?ob=${token}`, Method: 'POST',
     StatusCallback: `${publicBase}/twilio/status`, StatusCallbackMethod: 'POST',
     MachineDetection: 'Enable', AsyncAmd: 'true', AsyncAmdStatusCallback: `${publicBase}/twilio/status`,
-    Timeout: '25', TimeLimit: '900',
+    Timeout: '25', TimeLimit: rcp.merge ? '1200' : '900',
   });
   const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${config.twilioAccountSid}/Calls.json`, {
     method: 'POST',
