@@ -404,7 +404,13 @@ export function createMediaBridge(twilioWs, options = {}) {
       return;
     }
     if (type === 'input_audio_buffer.speech_started') {
-      bargeIn();
+      // Only barge in if speech is sustained (short noise bursts are ignored).
+      if (state.bargeTimer) clearTimeout(state.bargeTimer);
+      state.bargeTimer = setTimeout(() => { state.bargeTimer = null; bargeIn(); }, Number(process.env.BARGE_IN_MIN_MS || 400));
+      return;
+    }
+    if (type === 'input_audio_buffer.speech_stopped') {
+      if (state.bargeTimer) { clearTimeout(state.bargeTimer); state.bargeTimer = null; }
       return;
     }
     if (type === 'response.output_audio.delta' || type === 'response.audio.delta') {
@@ -559,6 +565,7 @@ export function createMediaBridge(twilioWs, options = {}) {
     state.closed = true;
     if (state.inboundTimer) clearTimeout(state.inboundTimer);
     if (state.hangupTimer) clearTimeout(state.hangupTimer);
+    if (state.bargeTimer) clearTimeout(state.bargeTimer);
     try { state.openai?.close(); } catch { /* ignore */ }
     try {
       if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();

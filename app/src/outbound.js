@@ -45,13 +45,17 @@ ${isAnna ? `# LIMITS FOR THIS CALLER
 Family-level only: no business, client, tax, audit, or financial/account details for any of Jason's companies.
 Do not book, buy, cancel, send emails/texts, or commit Jason to anything. If she asks for an action, say you'll pass it to Jason for his OK.` : ''}
 
-# ENDING
-When the conversation wraps up (or they say bye), say a short goodbye and call end_call with a 1-3 sentence summary and any requests for Jason. Keep the whole call short unless they want to talk.`;
+${rec.interview ? `# INTERVIEW GOAL (this call is a conversation, not just a message)
+${clip(rec.interview, 2000)}
+Ask one question at a time, confirm what you heard, and keep going until each item is covered or they want to stop. Take as long as they need.
+
+` : ''}# ENDING
+When the conversation wraps up (or they say bye), say a short goodbye and call end_call with a 1-3 sentence summary and any requests for Jason. Keep the call short unless they want to talk or there is an interview goal.`;
 }
 
 export const FAMILY_TOOL_NAMES = new Set(['web_search', 'resolve_calendar', 'end_call']);
 
-export async function placeOutboundCall({ who, message, thread, publicBase }) {
+export async function placeOutboundCall({ who, message, thread, interview, publicBase }) {
   const rcp = RECIPIENTS[who];
   if (!rcp) return { status: 400, body: { ok: false, error: 'unknown_recipient', allowed: Object.keys(RECIPIENTS) } };
   if (!rcp.enabled()) return { status: 200, body: { ok: false, reason: `${who}_calls_off` } };
@@ -61,7 +65,7 @@ export async function placeOutboundCall({ who, message, thread, publicBase }) {
   if (wait > 0) return { status: 429, body: { ok: false, reason: 'rate_limited', retry_after_s: Math.ceil(wait / 1000) } };
   if (!config.twilioAccountSid || !config.twilioAuthToken || !publicBase) return { status: 503, body: { ok: false, error: 'twilio_or_public_base_unset' } };
   const token = crypto.randomBytes(12).toString('hex');
-  const rec = { token, who, name: rcp.name, to, message, thread, transcript: [], created: Date.now(), exp: Date.now() + TTL_MS };
+  const rec = { token, who, name: rcp.name, to, message, thread, interview, transcript: [], created: Date.now(), exp: Date.now() + TTL_MS };
   registry.set(token, rec);
   lastCallAt.set(who, Date.now());
   const form = new URLSearchParams({
@@ -82,10 +86,10 @@ export async function placeOutboundCall({ who, message, thread, publicBase }) {
   return { status: 200, body: { ok: true, callSid: j.sid, status: j.status } };
 }
 
-export function previewOutbound({ who, message, thread }) {
+export function previewOutbound({ who, message, thread, interview }) {
   const rcp = RECIPIENTS[who];
   if (!rcp) return { ok: false, error: 'unknown_recipient' };
-  const rec = { who, name: rcp.name, message, thread };
+  const rec = { who, name: rcp.name, message, thread, interview };
   return { ok: true, dry_run: true, who, enabled: rcp.enabled(), phone_set: Boolean(rcp.phone()), instructions: buildFamilyInstructions(rec), tools: [...FAMILY_TOOL_NAMES] };
 }
 
@@ -93,22 +97,22 @@ export function previewOutbound({ who, message, thread }) {
 export async function reportOutboundCall(rec, { endSummary, reason } = {}) {
   if (!rec || rec.reported) return; rec.reported = true;
   const transcript = rec.transcript.map((t) => `${t.role === 'user' ? rec.name.split(' ')[0] : 'Grokberto'}: ${t.text}`).join('\n').slice(0, 12000);
-  let summary = endSummary || '', requests_for_jason = [], reached = rec.transcript.some((t) => t.role === 'user');
+  let summary = endSummary || '', requests_for_jason = [], items = [], reached = rec.transcript.some((t) => t.role === 'user');
   if (transcript && config.openaiApiKey) {
     try {
       const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST', headers: { Authorization: `Bearer ${config.openaiApiKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: config.openaiChatModel, response_format: { type: 'json_object' }, messages: [
-          { role: 'system', content: 'Summarize this phone call for Jason. Return JSON {"summary": "2-4 short sentences", "requests_for_jason": ["..."], "reached_human": true|false}. reached_human is false if it was voicemail/screening/no human.' },
+          { role: 'system', content: 'Summarize this phone call for Jason. Return JSON {"summary": "2-4 short sentences", "requests_for_jason": ["..."], "items": [{"name","scope","deadline","budget","materials_access","contact","notes"}], "reached_human": true|false}. items lists each project/task discussed (empty array if none; omit unknown fields). reached_human is false if it was voicemail/screening/no human.' },
           { role: 'user', content: `Message delivered: ${rec.message}\n\nTranscript:\n${transcript}` } ] }),
       });
       const j = await r.json(); const o = JSON.parse(j.choices?.[0]?.message?.content || '{}');
-      summary = o.summary || summary; requests_for_jason = Array.isArray(o.requests_for_jason) ? o.requests_for_jason : []; if (typeof o.reached_human === 'boolean') reached = o.reached_human;
+      summary = o.summary || summary; requests_for_jason = Array.isArray(o.requests_for_jason) ? o.requests_for_jason : []; items = Array.isArray(o.items) ? o.items : []; if (typeof o.reached_human === 'boolean') reached = o.reached_human;
     } catch { /* keep fallbacks */ }
   }
   const url = process.env.ROUTINE_URL, key = process.env.ROUTINE_KEY;
   if (!url) return;
   const payload = { source: `${rec.who}_call_summary`, who: rec.who, call_sid: rec.callSid, reached_human: reached, answered_by: rec.answeredBy || null, end_reason: reason || null,
-    message_delivered: rec.message, summary: summary || (transcript ? '' : 'No conversation (unanswered, voicemail, or hung up).'), requests_for_jason, transcript };
+    message_delivered: rec.message, summary: summary || (transcript ? '' : 'No conversation (unanswered, voicemail, or hung up).'), requests_for_jason, items, to_masked: rec.to ? rec.to.replace(/.(?=.{4})/g, '*') : null, transcript };
   await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(payload) }).catch(() => {});
 }

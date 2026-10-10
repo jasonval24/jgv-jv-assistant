@@ -254,10 +254,11 @@ export function createServer(options = {}) {
     const who = String(req.body?.to || '').toLowerCase();
     const message = String(req.body?.message || '').trim().slice(0, 4000);
     const thread = Array.isArray(req.body?.thread) ? req.body.thread.slice(-20) : [];
+    const interview = String(req.body?.interview || '').trim().slice(0, 2000);
     if (!message) { res.status(400).json({ ok: false, error: 'message_required' }); return; }
-    if (req.body?.dry_run) { res.json(previewOutbound({ who, message, thread })); return; }
+    if (req.body?.dry_run) { res.json(previewOutbound({ who, message, thread, interview })); return; }
     try {
-      const r = await placeOutboundCall({ who, message, thread, publicBase: config.publicBaseUrl || publicBaseFromRequest(req) });
+      const r = await placeOutboundCall({ who, message, thread, interview, publicBase: config.publicBaseUrl || publicBaseFromRequest(req) });
       logger('outbound_call_request', { who, ok: Boolean(r.body?.ok), callSid: r.body?.callSid || null, reason: r.body?.reason || r.body?.error || null });
       res.status(r.status).json(r.body);
     } catch (err) {

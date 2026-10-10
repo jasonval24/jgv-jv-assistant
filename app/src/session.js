@@ -41,10 +41,15 @@ export function buildSessionConfig(options = {}) {
   };
   if (options.phoneAudio) {
     audio.input.format = { type: 'audio/pcmu' };
+    // Noise-robust turn detection: background noise should not trigger replies or barge-in.
+    audio.input.noise_reduction = { type: process.env.VAD_NOISE_REDUCTION || 'near_field' };
     audio.input.turn_detection = {
       type: 'server_vad',
+      threshold: Number(process.env.VAD_THRESHOLD || 0.8),
+      prefix_padding_ms: Number(process.env.VAD_PREFIX_MS || 500),
+      silence_duration_ms: Number(process.env.VAD_SILENCE_MS || 800),
       create_response: true,
-      interrupt_response: true,
+      interrupt_response: false, // barge-in handled in the bridge only after sustained speech
     };
     audio.output.format = { type: 'audio/pcmu' };
   }
