@@ -4,6 +4,7 @@ app/node_modules/
 .env.*
 !.env.example
 app/transcripts/
+app/data/
 *.log
 coverage/
 .DS_Store

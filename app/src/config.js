@@ -29,7 +29,9 @@ export const config = {
   openaiModel: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime',
   openaiChatModel: process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini',
   openaiVoice: process.env.OPENAI_VOICE || 'verse',
-  transferToJason: process.env.TRANSFER_TO_JASON || '+19564601983',
+  /** Jason's cell — env only, never hardcoded. */
+  transferToJason: String(process.env.TRANSFER_TO_JASON || process.env.JASON_CELL || '').trim(),
+  jasonCell: String(process.env.JASON_CELL || process.env.TRANSFER_TO_JASON || '').trim(),
   /** Personal DID — JV Assistant McAllen 956. Never the Art 361 number. */
   twilioVoiceNumber: process.env.TWILIO_VOICE_NUMBER || '+19564684455',
   twilioAccountSid: process.env.TWILIO_ACCOUNT_SID || '',
@@ -44,7 +46,11 @@ export const config = {
     loadBoxSecret('TELEGRAM_BOT_TOKEN') ||
     '',
   telegramChatId: String(process.env.TELEGRAM_CHAT_ID || '8787733574'),
-  jasonCell: '+19564601983',
+  dataDir: process.env.DATA_DIR || path.join(APP_ROOT, 'data'),
+  memoryRetentionDays: Number(process.env.MEMORY_RETENTION_DAYS || 60),
+  reminderPollSeconds: Number(process.env.REMINDER_POLL_SECONDS || 20),
+  timezone: process.env.JASON_TIMEZONE || 'America/Chicago',
+  twilioVoiceIntelligenceSid: String(process.env.TWILIO_VOICE_INTELLIGENCE_SID || '').trim(),
   serviceName: 'jgv-jv-assistant',
 };
 

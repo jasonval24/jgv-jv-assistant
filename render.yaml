@@ -35,3 +35,15 @@ services:
         sync: false
       - key: OPENAI_CHAT_MODEL
         value: "gpt-4o-mini"
+      - key: JASON_CELL
+        sync: false
+      - key: DATA_DIR
+        sync: false
+      - key: MEMORY_RETENTION_DAYS
+        sync: false
+      - key: JASON_TIMEZONE
+        sync: false
+      - key: REMINDER_POLL_SECONDS
+        sync: false
+      - key: TWILIO_VOICE_INTELLIGENCE_SID
+        sync: false

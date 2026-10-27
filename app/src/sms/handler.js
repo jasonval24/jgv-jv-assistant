@@ -1,15 +1,18 @@
 import { config, loadCanonicalPrompt, redact } from '../config.js';
-import { normalizeE164, TRANSFER_TARGET_E164 } from '../twilio/numbers.js';
+import { isJasonCaller, normalizeE164 } from '../twilio/numbers.js';
 import { notifyJason } from '../telegram.js';
 import { logEvent } from '../twilio/log.js';
+import { runWithCallContext } from '../call-context.js';
+import { runTool } from '../tools/handlers.js';
+import { SMS_JASON_TOOL_NAMES, toChatTools, toolDefinitions } from '../tools/definitions.js';
 
 const SMS_SYSTEM = () => `${loadCanonicalPrompt()}
 
 # SMS CHANNEL
 You are responding over SMS from Jason's personal number (956) 468-4455.
 Keep replies short (1–3 short sentences). Plain text only — no markdown.
-If the sender is Jason (his cell), help with general questions; for calendar/email say you'll notify him / that live calendar-email is being escalated.
-If the sender is someone else: answer public questions briefly, offer to take a message for Jason, do not invent private facts.
+If the sender is Jason (his cell): help with general questions; you may call, text, schedule reminders, recall memory, and search past Twilio calls — but only when he explicitly asks in this thread. If you are unsure of a private fact, use call_jason instead of guessing.
+If the sender is someone else: answer public questions briefly, offer to take a message for Jason, do not invent private facts. Never place a call or send a text to a third party.
 When you cannot help, say you'll pass it to Jason.
 `;
 
@@ -19,7 +22,7 @@ When you cannot help, say you'll pass it to Jason.
  */
 export async function handleInboundSms({ from, to, body, messageSid }) {
   const fromE164 = normalizeE164(from);
-  const isJason = fromE164 === TRANSFER_TARGET_E164;
+  const isJason = isJasonCaller(fromE164 || from);
   const text = String(body || '').trim();
 
   logEvent('sms_inbound', {
@@ -61,37 +64,68 @@ export async function handleInboundSms({ from, to, body, messageSid }) {
   }
 
   try {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${config.openaiApiKey}`,
-        'Content-Type': 'application/json',
+    const messages = [
+      { role: 'system', content: SMS_SYSTEM() },
+      {
+        role: 'user',
+        content: `Sender: ${fromE164 || from}${isJason ? ' (this is Jason himself)' : ''}\nSMS: ${text}`,
       },
-      body: JSON.stringify({
-        model: config.openaiChatModel,
-        temperature: 0.4,
-        max_tokens: 220,
-        messages: [
-          { role: 'system', content: SMS_SYSTEM() },
-          {
-            role: 'user',
-            content: `Sender: ${fromE164 || from}${isJason ? ' (this is Jason himself)' : ''}\nSMS: ${text}`,
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(20000),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      console.error('[sms] openai error', res.status, redact({ error: data.error }));
-      return {
-        reply: isJason
-          ? 'Got it — forwarded to Telegram. (AI reply briefly unavailable.)'
-          : "Thanks — I've let Jason know. He'll follow up.",
-        telegramNotified: tg.ok === true,
-      };
+    ];
+    const tools = isJason
+      ? toChatTools(toolDefinitions.filter((t) => SMS_JASON_TOOL_NAMES.has(t.name)))
+      : undefined;
+    let reply = '';
+    for (let i = 0; i < 4; i++) {
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${config.openaiApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: config.openaiChatModel,
+          temperature: 0.4,
+          max_tokens: 280,
+          messages,
+          ...(tools ? { tools, tool_choice: 'auto' } : {}),
+        }),
+        signal: AbortSignal.timeout(25000),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        console.error('[sms] openai error', res.status, redact({ error: data.error }));
+        return {
+          reply: isJason
+            ? 'Got it — forwarded to Telegram. (AI reply briefly unavailable.)'
+            : "Thanks — I've let Jason know. He'll follow up.",
+          telegramNotified: tg.ok === true,
+        };
+      }
+      const msg = data.choices?.[0]?.message || {};
+      const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+      if (!calls.length) {
+        reply = String(msg.content || '').trim();
+        break;
+      }
+      messages.push(msg);
+      for (const call of calls) {
+        let args = {};
+        try {
+          args = call.function?.arguments ? JSON.parse(call.function.arguments) : {};
+        } catch {
+          args = {};
+        }
+        const toolResult = await runWithCallContext(
+          { channel: 'sms', from: fromE164 || from, actor: isJason ? 'jason' : 'other' },
+          () => runTool(call.function?.name, args)
+        );
+        messages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: JSON.stringify(toolResult ?? { ok: false }),
+        });
+      }
     }
-    let reply = String(data.choices?.[0]?.message?.content || '').trim();
     if (!reply) {
       reply = isJason
         ? 'Got it — noted on Telegram.'

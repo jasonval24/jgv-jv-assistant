@@ -14,6 +14,34 @@ export const RECIPIENTS = {
   jason: { name: 'Jason Valenzuela', phone: () => config.jasonCell, enabled: () => (process.env.JASON_OUTBOUND_CALLS || 'off').toLowerCase() === 'on' },
 };
 
+/** Register a general-purpose Realtime outbound (Jason-authorized conversation / escalate / reminder). */
+export function registerRealtimeJob(rec = {}) {
+  const token = rec.token || crypto.randomBytes(12).toString('hex');
+  const record = {
+    token,
+    kind: rec.kind || rec.purpose || 'conversation',
+    purpose: rec.purpose || 'conversation',
+    who: rec.who || 'custom',
+    name: rec.name || 'contact',
+    to: rec.to,
+    message: rec.message || '',
+    instructions: rec.instructions || '',
+    thread: rec.thread || [],
+    interview: rec.interview || '',
+    transcript: [],
+    created: Date.now(),
+    exp: Date.now() + TTL_MS,
+  };
+  registry.set(token, record);
+  return token;
+}
+
+export function isFamilyOutbound(rec) {
+  if (!rec) return false;
+  if (rec.purpose === 'escalate' || rec.purpose === 'conversation' || rec.purpose === 'reminder') return false;
+  return rec.kind === 'family' || rec.who === 'anna' || rec.merge === true || rec.direction === 'inbound';
+}
+
 setInterval(() => { const n = Date.now(); for (const [k, v] of registry) if (v.exp < n) registry.delete(k); }, 60000).unref();
 
 const DEFAULT_ANNA_INBOUND_MESSAGE = "Jason asked me to go over the projects you have for Ollie, so I can coordinate with Ollie. For each project, what do you want done, and when do you need it by?";
@@ -24,7 +52,7 @@ const norm = (p) => String(p || '').replace(/[^0-9]/g, '').slice(-10);
 export function inboundFamilyRecord(from) {
   const anna = process.env.ANNA_PHONE || '+19564571661';
   if ((process.env.ANNA_INBOUND || 'on').toLowerCase() === 'off' || !from || norm(from) !== norm(anna)) return null;
-  return { token: null, who: 'anna', name: 'Anna Valenzuela', direction: 'inbound', to: from,
+  return { token: null, kind: 'family', who: 'anna', name: 'Anna Valenzuela', direction: 'inbound', to: from,
     message: process.env.ANNA_INBOUND_MESSAGE || DEFAULT_ANNA_INBOUND_MESSAGE,
     interview: process.env.ANNA_INBOUND_INTERVIEW || DEFAULT_ANNA_INBOUND_INTERVIEW,
     thread: [
@@ -79,6 +107,69 @@ When the conversation wraps up (or they say bye), say a short goodbye and call e
 
 export const FAMILY_TOOL_NAMES = new Set(['web_search', 'resolve_calendar', 'end_call']);
 
+/** Third-party conversation: no outbound chaining. */
+export const THIRD_PARTY_OUTBOUND_TOOL_NAMES = new Set([
+  'web_search',
+  'resolve_calendar',
+  'end_call',
+  'remember',
+  'call_jason',
+  'save_message_for_jason',
+]);
+
+export function buildGeneralOutboundInstructions(rec) {
+  const now = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Chicago', dateStyle: 'full', timeStyle: 'short' }).format(new Date());
+  const purpose = rec.purpose || 'conversation';
+  const message = clip(rec.message || rec.instructions, 3000);
+  if (purpose === 'escalate') {
+    return `# ROLE
+You are JV Assistant calling Jason Valenzuela because you are unsure and must not guess.
+It is ${now} (America/Chicago; never say the time zone aloud).
+
+# WHY YOU ARE CALLING
+${message || 'You need Jason to decide something you cannot answer from what you know.'}
+
+# OPENING
+First words: "Hi Jason, it's JV Assistant." Then state the question in one or two sentences. Wait for him. Do not invent an answer while you wait.
+If you reach voicemail, leave a short version of the question, say you'll also text/Telegram him, then end_call.
+
+# ENDING
+When you have his answer (or voicemail), say goodbye and call end_call with a short summary of what he decided.`;
+  }
+  if (purpose === 'reminder') {
+    return `# ROLE
+You are JV Assistant calling Jason Valenzuela with a reminder he asked you to place.
+It is ${now} (America/Chicago; never say the time zone aloud).
+
+# REMINDER
+${message}
+
+# OPENING
+First words: "Hi Jason, it's JV Assistant with your reminder." Then deliver the reminder in your own words. If he wants to talk, help. If voicemail, leave the reminder once and end_call.
+
+# ENDING
+When done, end_call with a one-sentence summary.`;
+  }
+  return `# ROLE
+You are JV Assistant placing an outbound call that Jason Valenzuela explicitly asked for.
+It is ${now} (America/Chicago; never say the time zone aloud).
+Talk like a warm, natural person: short sentences, no markdown, no URLs.
+
+# JASON'S INSTRUCTIONS FOR THIS CALL
+${message || '(No extra instructions — greet them and ask how you can help on Jason\'s behalf.)'}
+
+# OPENING
+First words: introduce yourself as JV Assistant calling for Jason Valenzuela, then deliver the request. Do not ask "can you hear me".
+If you hear voicemail or a beep: leave a one- or two-sentence version of the message, then end_call.
+
+# LIMITS
+Do not promise things Jason did not authorize. If you are unsure, call_jason (escalate) instead of guessing.
+Do not place further calls or send texts from this call.
+
+# ENDING
+When the conversation wraps up, say goodbye and end_call with a 1-3 sentence summary and any reply for Jason.`;
+}
+
 export async function placeOutboundCall({ who, message, thread, interview, publicBase }) {
   const rcp = RECIPIENTS[who];
   if (!rcp) return { status: 400, body: { ok: false, error: 'unknown_recipient', allowed: Object.keys(RECIPIENTS) } };
@@ -89,7 +180,7 @@ export async function placeOutboundCall({ who, message, thread, interview, publi
   if (wait > 0) return { status: 429, body: { ok: false, reason: 'rate_limited', retry_after_s: Math.ceil(wait / 1000) } };
   if (!config.twilioAccountSid || !config.twilioAuthToken || !publicBase) return { status: 503, body: { ok: false, error: 'twilio_or_public_base_unset' } };
   const token = crypto.randomBytes(12).toString('hex');
-  const rec = { token, who: rcp.summaryWho || who, merge: !!rcp.merge, name: rcp.name, to, message, thread, interview, transcript: [], created: Date.now(), exp: Date.now() + TTL_MS };
+  const rec = { token, kind: 'family', who: rcp.summaryWho || who, merge: !!rcp.merge, name: rcp.name, to, message, thread, interview, transcript: [], created: Date.now(), exp: Date.now() + TTL_MS };
   registry.set(token, rec);
   lastCallAt.set(who, Date.now());
   const form = new URLSearchParams({
@@ -99,6 +190,12 @@ export async function placeOutboundCall({ who, message, thread, interview, publi
     MachineDetection: 'Enable', AsyncAmd: 'true', AsyncAmdStatusCallback: `${publicBase}/twilio/status`,
     Timeout: '25', TimeLimit: rcp.merge ? '1200' : '900',
   });
+  const destIsJason = norm(to) === norm(config.jasonCell);
+  if (!destIsJason) {
+    form.set('Record', 'true');
+    form.set('RecordingStatusCallback', `${publicBase}/twilio/recording`);
+    form.set('RecordingStatusCallbackMethod', 'POST');
+  }
   const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${config.twilioAccountSid}/Calls.json`, {
     method: 'POST',
     headers: { Authorization: 'Basic ' + Buffer.from(`${config.twilioAccountSid}:${config.twilioAuthToken}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },

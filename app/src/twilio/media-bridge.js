@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import { runWithCallContext } from '../call-context.js';
 import { runTool } from '../tools/handlers.js';
 import { buildSessionConfig } from '../session.js';
-import { callSessionIdForCallSid, normalizeE164, TRANSFER_TARGET_E164 } from './numbers.js';
+import { callSessionIdForCallSid, isJasonCaller } from './numbers.js';
 import { hangupLiveCall } from './transfer.js';
 import { logEvent } from './log.js';
 
@@ -24,8 +24,7 @@ export function defaultOpenAIFactory({ model, apiKey }) {
 }
 
 export async function defaultCallerLookup(from) {
-  const e164 = normalizeE164(from);
-  if (e164 && e164 === TRANSFER_TARGET_E164) {
+  if (isJasonCaller(from)) {
     return { firstName: 'Jason', lastName: 'Valenzuela', isJason: true };
   }
   return null;
@@ -41,13 +40,13 @@ export function buildPhoneInstructionsPrefix({ callSid, callSessionId, from, to,
     `Caller ID (From): ${from || 'unknown'}`,
     `Called number (To): ${to || 'unknown'}`,
     isJason
-      ? "Caller ID matches Jason Valenzuela's cell. Greet him as Jason. Help with what you can; for calendar/email you cannot see live — take a note via save_message_for_jason (Telegram) rather than inventing."
+      ? "Caller ID matches Jason Valenzuela's cell. Greet him as Jason. You may place calls or send texts only when he explicitly asks in this conversation. If you are unsure of a private fact, call_jason rather than guessing. Use recall_memory / search_call_transcripts when he asks what was decided earlier."
       : name
         ? `Known caller name hint: ${name}. Use naturally if it fits; if they give a different name, trust the caller.`
         : 'Unknown caller. Ask for their name when you need it.',
     'This is JV Assistant for Jason Valenzuela — personal line, NOT Blueshore Art.',
-    'transfer_to_jason dials Jason on this live call. If the tool returns ok:false, apologize and offer save_message_for_jason.',
-    'Use end_call when wrapping up.',
+    'transfer_to_jason warm-transfers this live caller to Jason. call_jason places a new outbound call to Jason when you are unsure.',
+    'Never call or text a third party unless Jason just told you to. Use end_call when wrapping up. Persist decisions with remember or end_call fields.',
   ].join('\n');
 }
 
@@ -71,7 +70,17 @@ function withTimeout(promise, ms) {
  * Bidirectional Twilio Media Streams ↔ OpenAI Realtime.
  * Audio is G.711 μ-law (audio/pcmu) on both sides. No transcoding.
  */
-import { getOutbound, inboundFamilyRecord, buildFamilyInstructions, FAMILY_TOOL_NAMES, reportOutboundCall } from '../outbound.js';
+import {
+  getOutbound,
+  inboundFamilyRecord,
+  buildFamilyInstructions,
+  buildGeneralOutboundInstructions,
+  FAMILY_TOOL_NAMES,
+  THIRD_PARTY_OUTBOUND_TOOL_NAMES,
+  isFamilyOutbound,
+  reportOutboundCall,
+} from '../outbound.js';
+import { INBOUND_OTHER_TOOL_NAMES } from '../tools/definitions.js';
 
 export function createMediaBridge(twilioWs, options = {}) {
   const logger = options.logger || logEvent;
@@ -334,8 +343,15 @@ export function createMediaBridge(twilioWs, options = {}) {
     try {
       if (state.outbound && name === 'end_call') {
         state.endSummary = String(args.summary || '');
-        result = { ok: true };
-      } else if (state.outbound && !FAMILY_TOOL_NAMES.has(name)) {
+        result = await runWithCallContext(context(), () => runToolFn(name, args));
+      } else if (state.outbound && isFamilyOutbound(state.outbound) && !FAMILY_TOOL_NAMES.has(name)) {
+        result = { ok: false, error: 'tool_not_available_on_this_call' };
+      } else if (
+        state.outbound &&
+        !isFamilyOutbound(state.outbound) &&
+        state.outbound.purpose === 'conversation' &&
+        !THIRD_PARTY_OUTBOUND_TOOL_NAMES.has(name)
+      ) {
         result = { ok: false, error: 'tool_not_available_on_this_call' };
       } else {
         result = await runWithCallContext(context(), () => runToolFn(name, args));
@@ -449,9 +465,20 @@ export function createMediaBridge(twilioWs, options = {}) {
 
   async function configureSession() {
     if (state.outbound) {
-      const session = buildSessionConfig({ phoneAudio: true, instructionsOverride: buildFamilyInstructions(state.outbound), toolFilter: FAMILY_TOOL_NAMES });
+      const family = isFamilyOutbound(state.outbound);
+      const session = buildSessionConfig({
+        phoneAudio: true,
+        instructionsOverride: family
+          ? buildFamilyInstructions(state.outbound)
+          : buildGeneralOutboundInstructions(state.outbound),
+        toolFilter: family
+          ? FAMILY_TOOL_NAMES
+          : state.outbound.purpose === 'conversation'
+            ? THIRD_PARTY_OUTBOUND_TOOL_NAMES
+            : null,
+      });
       sendOpenAI({ type: 'session.update', session });
-      logger('openai_session_update', { callSessionId: state.callSessionId, callSid: state.callSid, outbound: state.outbound.who, toolCount: session.tools.length });
+      logger('openai_session_update', { callSessionId: state.callSessionId, callSid: state.callSid, outbound: state.outbound.who, purpose: state.outbound.purpose || null, toolCount: session.tools.length });
       return;
     }
     const caller = await withTimeout(callerLookup(state.from), 800);
@@ -462,7 +489,11 @@ export function createMediaBridge(twilioWs, options = {}) {
       to: state.to,
       caller,
     });
-    const session = buildSessionConfig({ phoneAudio: true, instructionsPrefix: prefix });
+    const session = buildSessionConfig({
+      phoneAudio: true,
+      instructionsPrefix: prefix,
+      toolFilter: caller?.isJason ? null : INBOUND_OTHER_TOOL_NAMES,
+    });
     sendOpenAI({ type: 'session.update', session });
     logger('openai_session_update', {
       callSessionId: state.callSessionId,
