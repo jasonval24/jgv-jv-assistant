@@ -4,6 +4,28 @@ import { config, redact } from '../config.js';
 import { getCallContext } from '../call-context.js';
 import { transferLiveCall } from '../twilio/transfer.js';
 import { notifyJason } from '../telegram.js';
+import { evaluatePhoneConsent, resolveActor } from '../consent.js';
+import { loadAndRecall, remember as persistMemory } from '../memory.js';
+import { cancelReminder, listReminders, scheduleReminder } from '../reminders.js';
+import { jobStore, memoryStore, reminderStore } from '../stores.js';
+import { placeOutboundPhoneCall, sendSms } from '../phone/actions.js';
+import { registerRealtimeJob } from '../outbound.js';
+import { jasonCellE164, normalizeE164 } from '../twilio/numbers.js';
+import { fetchCallTranscript, listRecentCalls, searchCallTranscripts } from '../twilio/transcripts.js';
+
+function actorFromContext() {
+  const ctx = getCallContext();
+  if (ctx?.actor) return ctx.actor;
+  return resolveActor({
+    from: ctx?.from,
+    jasonCell: config.jasonCell,
+    normalize: normalizeE164,
+  });
+}
+
+function explicitFromArgs(args) {
+  return args?.jason_explicit_request === true || args?.jason_explicit_request === 'true';
+}
 
 function logTool(name, args, result) {
   console.log(`[tool:${name}]`, JSON.stringify(redact({ args, result })));
@@ -260,12 +282,267 @@ export async function end_call(args = {}) {
     hangup: ctx?.channel === 'pstn' ? 'twilio_after_playback' : 'close',
     callSessionId,
   };
+  try {
+    persistMemory(
+      memoryStore,
+      {
+        channel: ctx?.channel || 'voice',
+        conversationId: callSessionId,
+        callSid: ctx?.callSid || null,
+        title: args.caller_name || 'call',
+        summary,
+        decisions: args.decisions,
+        action_items: args.action_items,
+        key_statements: args.key_statements,
+      },
+      { now: new Date(), timeZone: config.timezone, retentionDays: config.memoryRetentionDays }
+    );
+  } catch {
+    /* memory persist is best-effort */
+  }
   logTool('end_call', { ...args, transcript: transcript ? `[len=${transcript.length}]` : '' }, result);
+  return result;
+}
+
+export async function call_jason(args = {}) {
+  const question = String(args.question || args.reason || '').trim();
+  if (!question) {
+    const result = { ok: false, error: 'missing_question' };
+    logTool('call_jason', args, result);
+    return result;
+  }
+  const to = jasonCellE164();
+  if (!to) {
+    const result = { ok: false, error: 'jason_cell_unset', agent_hint: 'JASON_CELL / TRANSFER_TO_JASON is not set.' };
+    logTool('call_jason', args, result);
+    return result;
+  }
+  const actor = actorFromContext();
+  const result = await placeOutboundPhoneCall({
+    store: jobStore,
+    to,
+    message: question,
+    purpose: 'escalate',
+    actor,
+    jasonCell: config.jasonCell,
+    explicitInCurrentConversation: explicitFromArgs(args),
+    publicBase: config.publicBaseUrl,
+    registerRealtime: (rec) => registerRealtimeJob({ ...rec, purpose: 'escalate', who: 'jason', name: 'Jason Valenzuela' }),
+  });
+  if (result.ok) {
+    void notifyJason(`📞 JV Assistant is calling you (escalate).\nQuestion: ${question.slice(0, 800)}`);
+  }
+  logTool('call_jason', args, result);
+  return result;
+}
+
+export async function deliver_message_call(args = {}) {
+  const actor = actorFromContext();
+  const result = await placeOutboundPhoneCall({
+    store: jobStore,
+    to: args.to,
+    message: args.message,
+    purpose: 'deliver_message',
+    actor,
+    jasonCell: config.jasonCell,
+    explicitInCurrentConversation: explicitFromArgs(args),
+    publicBase: config.publicBaseUrl,
+  });
+  logTool('deliver_message_call', args, result);
+  return result;
+}
+
+export async function place_call(args = {}) {
+  const actor = actorFromContext();
+  const result = await placeOutboundPhoneCall({
+    store: jobStore,
+    to: args.to,
+    message: args.instructions || args.message,
+    instructions: args.instructions || args.message,
+    purpose: 'conversation',
+    actor,
+    jasonCell: config.jasonCell,
+    explicitInCurrentConversation: explicitFromArgs(args),
+    publicBase: config.publicBaseUrl,
+    registerRealtime: (rec) => registerRealtimeJob({ ...rec, purpose: 'conversation' }),
+  });
+  logTool('place_call', args, result);
+  return result;
+}
+
+export async function send_sms(args = {}) {
+  const actor = actorFromContext();
+  const result = await sendSms({
+    to: args.to,
+    body: args.body,
+    actor,
+    jasonCell: config.jasonCell,
+    explicitInCurrentConversation: explicitFromArgs(args),
+  });
+  logTool('send_sms', args, result);
+  return result;
+}
+
+export async function schedule_reminder(args = {}) {
+  const actor = actorFromContext();
+  const channel = String(args.channel || '');
+  const jason = jasonCellE164();
+  const dest = channel === 'sms_other' ? args.to : jason;
+  const targetKind = channel === 'sms_other' ? 'third_party' : 'jason';
+  const gate = evaluatePhoneConsent({
+    actor,
+    action: channel.startsWith('sms') ? 'sms' : 'call',
+    targetKind,
+    explicitInCurrentConversation: explicitFromArgs(args),
+    purpose: 'reminder',
+  });
+  if (!gate.allowed) {
+    const result = { ok: false, error: 'consent_denied', reason: gate.reason };
+    logTool('schedule_reminder', args, result);
+    return result;
+  }
+  if (!dest) {
+    const result = { ok: false, error: channel === 'sms_other' ? 'missing_to' : 'jason_cell_unset' };
+    logTool('schedule_reminder', args, result);
+    return result;
+  }
+  const ctx = getCallContext();
+  const result = scheduleReminder(reminderStore, {
+    channel,
+    to: dest,
+    toJason: channel !== 'sms_other',
+    content: args.content,
+    whenIso: args.when_iso,
+    whenPhrase: args.when_phrase,
+    now: new Date(),
+    timeZone: config.timezone,
+    conversationId: ctx?.callSessionId || null,
+  });
+  logTool('schedule_reminder', args, result.ok ? { ok: true, id: result.reminder?.id, fireAt: result.reminder?.fireAt } : result);
+  return result.ok
+    ? {
+        ok: true,
+        id: result.reminder.id,
+        fireAt: result.reminder.fireAt,
+        channel: result.reminder.channel,
+        agent_hint: `Reminder saved for ${result.reminder.fireAt}. It will survive restarts if DATA_DIR is on a persistent disk.`,
+      }
+    : result;
+}
+
+export async function list_reminders() {
+  const rows = listReminders(reminderStore);
+  const result = {
+    ok: true,
+    reminders: rows.map((r) => ({
+      id: r.id,
+      channel: r.channel,
+      fireAt: r.fireAt,
+      content: r.content,
+      status: r.status,
+    })),
+  };
+  logTool('list_reminders', {}, { ok: true, count: result.reminders.length });
+  return result;
+}
+
+export async function cancel_reminder(args = {}) {
+  const result = cancelReminder(reminderStore, String(args.id || ''));
+  logTool('cancel_reminder', args, result);
+  return result;
+}
+
+export async function remember(args = {}) {
+  const ctx = getCallContext();
+  const result = persistMemory(
+    memoryStore,
+    {
+      channel: ctx?.channel || args.channel || 'voice',
+      conversationId: ctx?.callSessionId || args.conversationId || null,
+      callSid: ctx?.callSid || args.callSid || null,
+      title: args.title,
+      summary: args.summary,
+      decisions: args.decisions,
+      action_items: args.action_items,
+      key_statements: args.key_statements,
+    },
+    { now: new Date(), timeZone: config.timezone, retentionDays: config.memoryRetentionDays }
+  );
+  logTool('remember', args, result);
+  return result;
+}
+
+export async function recall_memory(args = {}) {
+  const days = Number(args.retention_days || config.memoryRetentionDays || 60);
+  const result = loadAndRecall(memoryStore, {
+    query: args.query,
+    now: new Date(),
+    retentionDays: days,
+    limit: 8,
+  });
+  result.agent_hint =
+    result.matchCount > 0
+      ? 'Cite the date and call/conversation reference. Quote the decision and what was said. Do not invent extra detail.'
+      : 'Nothing in the memory window matched. Say so honestly. You may also try search_call_transcripts.';
+  logTool('recall_memory', args, { ok: result.ok, matchCount: result.matchCount });
+  return result;
+}
+
+export async function list_recent_calls(args = {}) {
+  const result = await listRecentCalls({
+    accountSid: config.twilioAccountSid,
+    authToken: config.twilioAuthToken,
+    pageSize: Number(args.limit || 15),
+  });
+  logTool('list_recent_calls', args, { ok: result.ok, count: result.calls?.length || 0, error: result.error || null });
+  return result;
+}
+
+export async function get_call_transcript(args = {}) {
+  const result = await fetchCallTranscript({
+    accountSid: config.twilioAccountSid,
+    authToken: config.twilioAuthToken,
+    openaiApiKey: config.openaiApiKey,
+    intelligenceServiceSid: config.twilioVoiceIntelligenceSid,
+    callSid: args.call_sid,
+  });
+  logTool('get_call_transcript', args, {
+    ok: result.ok,
+    source: result.source || null,
+    error: result.error || null,
+    textLen: result.text ? result.text.length : 0,
+  });
+  return result;
+}
+
+export async function search_call_transcripts(args = {}) {
+  const result = await searchCallTranscripts({
+    accountSid: config.twilioAccountSid,
+    authToken: config.twilioAuthToken,
+    openaiApiKey: config.openaiApiKey,
+    intelligenceServiceSid: config.twilioVoiceIntelligenceSid,
+    query: args.query,
+    sinceDays: Number(args.since_days || config.memoryRetentionDays || 60),
+    now: new Date(),
+  });
+  logTool('search_call_transcripts', args, { ok: result.ok, matchCount: result.matchCount || 0, error: result.error || null });
   return result;
 }
 
 export const handlers = {
   transfer_to_jason,
+  call_jason,
+  deliver_message_call,
+  place_call,
+  send_sms,
+  schedule_reminder,
+  list_reminders,
+  cancel_reminder,
+  remember,
+  recall_memory,
+  list_recent_calls,
+  get_call_transcript,
+  search_call_transcripts,
   save_message_for_jason,
   web_search,
   resolve_calendar,

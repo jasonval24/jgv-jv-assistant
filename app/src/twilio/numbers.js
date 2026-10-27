@@ -7,8 +7,19 @@ export const ART_TWILIO_DID_E164 = '+13613360871';
 /** JV Assistant personal DID (McAllen 956). */
 export const JV_TWILIO_DID_E164 = '+19564684455';
 
-/** Jason transfer / escalate target. */
-export const TRANSFER_TARGET_E164 = '+19564601983';
+/** Jason transfer / escalate target — reads env each call, never a hardcoded cell. */
+export function jasonCellE164() {
+  return normalizeE164(process.env.JASON_CELL || process.env.TRANSFER_TO_JASON || '');
+}
+
+/** @deprecated Prefer jasonCellE164() so tests/env updates are live. */
+export const TRANSFER_TARGET_E164 = jasonCellE164();
+
+export function isJasonCaller(phone) {
+  const jason = jasonCellE164();
+  const n = normalizeE164(phone);
+  return Boolean(jason && n && jason === n);
+}
 
 /** Alias used by transfer.js for caller-id fallback. */
 export const PILOT_TWILIO_DID_E164 = JV_TWILIO_DID_E164;

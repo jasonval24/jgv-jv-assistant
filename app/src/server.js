@@ -30,7 +30,13 @@ import { createMediaBridge } from './twilio/media-bridge.js';
 import { logEvent } from './twilio/log.js';
 import { handleInboundSms } from './sms/handler.js';
 import crypto from 'crypto';
-import { getOutbound, placeOutboundCall, previewOutbound } from './outbound.js';
+import { getOutbound, placeOutboundCall, previewOutbound, registerRealtimeJob } from './outbound.js';
+import { jobStore, reminderStore } from './stores.js';
+import { getJob, patchJob } from './phone/jobs.js';
+import { applyCallStatusToJob, placeOutboundPhoneCall, sendSms } from './phone/actions.js';
+import { deliverMessageTwiml, deliverReplyTwiml, finalizeDeliverJob } from './phone/deliver.js';
+import { startReminderScheduler } from './reminders.js';
+import { jasonCellE164 } from './twilio/numbers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, '../public');
@@ -93,7 +99,7 @@ export function createServer(options = {}) {
       telegramConfigured: Boolean(config.telegramBotToken),
       publicBaseUrl: config.publicBaseUrl || null,
       voiceDid: JV_TWILIO_DID_E164,
-      transferTarget: config.transferToJason || TRANSFER_TARGET_E164,
+      transferTarget: config.transferToJason || config.jasonCell || TRANSFER_TARGET_E164,
       protectedLeadConnector: PROTECTED_LEADCONNECTOR_E164,
       activeBridges: bridges.size,
       endpoints: {
@@ -103,7 +109,13 @@ export function createServer(options = {}) {
         status: '/twilio/status',
         media: '/twilio/media',
         dialResult: '/twilio/dial-result',
+        deliver: '/twilio/deliver',
+        recording: '/twilio/recording',
       },
+      memoryRetentionDays: config.memoryRetentionDays,
+      dataDirConfigured: Boolean(process.env.DATA_DIR),
+      voiceIntelligenceConfigured: Boolean(config.twilioVoiceIntelligenceSid),
+      jasonCellConfigured: Boolean(config.jasonCell),
     });
   });
 
@@ -266,13 +278,52 @@ export function createServer(options = {}) {
     }
   });
 
+  app.post('/twilio/deliver', (req, res) => {
+    if (!requireTwilioSignature(req, res)) return;
+    const tok = String(req.query?.tok || '');
+    const job = getJob(jobStore, tok);
+    if (!job) {
+      res.type('text/xml').status(200).send(sayHangupTwiml('Sorry, this call has expired. Goodbye.'));
+      return;
+    }
+    if (req.body?.CallSid) patchJob(jobStore, tok, { callSid: req.body.CallSid });
+    const gatherUrl = `${publicBaseFromRequest(req)}/twilio/deliver-reply?tok=${encodeURIComponent(tok)}`;
+    logger('deliver_twiml', { callSid: req.body?.CallSid || null, token: tok });
+    res.type('text/xml').status(200).send(deliverMessageTwiml({ message: job.message, gatherActionUrl: gatherUrl }));
+  });
+
+  app.post('/twilio/deliver-reply', (req, res) => {
+    if (!requireTwilioSignature(req, res)) return;
+    const tok = String(req.query?.tok || '');
+    const speech = String(req.body?.SpeechResult || req.body?.TranscriptionText || '').trim();
+    if (tok && speech) patchJob(jobStore, tok, { reply: speech });
+    logger('deliver_reply', { token: tok, hasReply: Boolean(speech) });
+    res.type('text/xml').status(200).send(deliverReplyTwiml());
+  });
+
+  app.post('/twilio/recording', (req, res) => {
+    if (!requireTwilioSignature(req, res)) return;
+    const callSid = req.body?.CallSid || '';
+    const recordingSid = req.body?.RecordingSid || '';
+    const job = applyCallStatusToJob(jobStore, { callSid });
+    if (job && recordingSid) patchJob(jobStore, job.token, { recordingSid });
+    logger('recording_ready', { callSid, recordingSid: recordingSid ? `RE…${String(recordingSid).slice(-4)}` : null });
+    res.type('text/xml').status(200).send(emptyTwiml());
+  });
+
   app.post('/twilio/status', (req, res) => {
     if (!requireTwilioSignature(req, res)) return;
     if (req.body?.AnsweredBy) logger('amd_result', { callSid: req.body?.CallSid || null, answeredBy: req.body.AnsweredBy });
     const callSid = req.body?.CallSid || '';
     const callStatus = String(req.body?.CallStatus || '').toLowerCase();
+    const answeredBy = req.body?.AnsweredBy || '';
     const callSessionId = callSessionIdForCallSid(callSid);
-    logger('call_status', { callSid, callStatus, callSessionId });
+    const job = applyCallStatusToJob(jobStore, { callSid, callStatus, answeredBy });
+    logger('call_status', { callSid, callStatus, callSessionId, purpose: job?.purpose || null });
+    const terminal = ['completed', 'no-answer', 'busy', 'failed', 'canceled'].includes(callStatus);
+    if (terminal && job && job.kind === 'deliver' && !job.reported) {
+      void finalizeDeliverJob(jobStore, { ...job, callStatus, answeredBy: answeredBy || job.answeredBy });
+    }
     res.type('text/xml').status(200).send(emptyTwiml());
   });
 
@@ -324,11 +375,37 @@ export function createServer(options = {}) {
     });
   });
 
-  return { app, server, wss, bridges, useHttps, dialActionUrl: dialActionUrl() };
+  const scheduler = options.startScheduler === false
+    ? null
+    : startReminderScheduler({
+        store: reminderStore,
+        intervalMs: Math.max(5, Number(config.reminderPollSeconds) || 20) * 1000,
+        sendSms: (args) =>
+          sendSms({
+            ...args,
+            jasonCell: config.jasonCell,
+          }),
+        placeCall: (args) =>
+          placeOutboundPhoneCall({
+            store: jobStore,
+            to: args.to || jasonCellE164(),
+            message: args.message,
+            purpose: 'reminder',
+            actor: args.actor || 'scheduler',
+            reminderAuthorized: true,
+            reminderId: args.reminderId,
+            publicBase: config.publicBaseUrl,
+            registerRealtime: (rec) =>
+              registerRealtimeJob({ ...rec, purpose: 'reminder', who: 'jason', name: 'Jason Valenzuela' }),
+          }),
+      });
+
+  return { app, server, wss, bridges, useHttps, scheduler, dialActionUrl: dialActionUrl() };
 }
 
-export async function shutdown(server, bridges) {
+export async function shutdown(server, bridges, scheduler) {
   logEvent('shutdown_start', { activeBridges: bridges?.size || 0 });
+  try { scheduler?.stop?.(); } catch { /* ignore */ }
   if (bridges) {
     for (const bridge of [...bridges]) {
       try { bridge.close(); } catch { /* ignore */ }
@@ -362,7 +439,7 @@ if (isMain) {
   const onSignal = (signal) => {
     if (stopping) return;
     stopping = true;
-    shutdown(started.server, started.bridges).finally(() => {
+    shutdown(started.server, started.bridges, started.scheduler).finally(() => {
       logEvent('shutdown_complete', { signal });
       process.exit(0);
     });
